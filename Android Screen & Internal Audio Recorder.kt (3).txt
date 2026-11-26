@@ -1,0 +1,489 @@
+package com.example.screenrecorder
+
+import android.Manifest
+import android.app.Activity
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
+import android.content.ContentValues
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
+import android.hardware.display.DisplayManager
+import android.hardware.display.VirtualDisplay
+import android.media.*
+import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
+import android.os.Build
+import android.os.Bundle
+import android.os.Environment
+import android.os.IBinder
+import android.provider.MediaStore
+import android.util.DisplayMetrics
+import android.view.Gravity
+import android.widget.Button
+import android.widget.LinearLayout
+import android.widget.TextView
+import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.annotation.RequiresApi
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
+import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
+import java.io.File
+import java.io.FileInputStream
+import java.nio.ByteBuffer
+import java.text.SimpleDateFormat
+import java.util.*
+import kotlin.concurrent.thread
+
+/**
+ * ============================================================================
+ * ANDROID SCREEN RECORDER WITH INTERNAL AUDIO (Android 10+ / API 29+)
+ * ============================================================================
+ * 
+ * REQUIRED AndroidManifest.xml PERMISSIONS & SERVICE DECLARATION:
+ * ----------------------------------------------------------------------------
+ * <uses-permission android:name="android.permission.RECORD_AUDIO" />
+ * <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+ * <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+ * <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+ * 
+ * <application ...>
+ *     <service
+ *         android:name=".ScreenRecordService"
+ *         android:enabled="true"
+ *         android:exported="false"
+ *         android:foregroundServiceType="mediaProjection" />
+ * </application>
+ * 
+ * HOW TO COMPILE & EXPORT APK TO PHONE STORAGE:
+ * ----------------------------------------------------------------------------
+ * 1. Open this project in Android Studio (or use Termux with Gradle/Android SDK).
+ * 2. Run in terminal: `./gradlew assembleDebug`
+ * 3. Locate the generated APK at:
+ *    `app/build/outputs/apk/debug/app-debug.apk`
+ * 4. Copy to your phone's internal storage:
+ *    `adb push app/build/outputs/apk/debug/app-debug.apk /sdcard/Download/ScreenRecorder.apk`
+ * ============================================================================
+ */
+
+class MainActivity : AppCompatActivity() {
+
+    private lateinit var mediaProjectionManager: MediaProjectionManager
+    private lateinit var statusText: TextView
+    private lateinit var toggleButton: Button
+    private var isRecording = false
+
+    // Launcher for Screen Capture permission dialog
+    private val screenCaptureLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK && result.data != null) {
+            startRecordingService(result.resultCode, result.data!!)
+            isRecording = true
+            updateUI()
+        } else {
+            Toast.makeText(this, "Screen capture permission denied", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        // Programmatic UI setup (No external XML layout needed)
+        val layout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setPadding(48, 48, 48, 48)
+        }
+
+        statusText = TextView(this).apply {
+            text = "Ready to Record (Screen + Internal Audio)"
+            textSize = 18f
+            gravity = Gravity.CENTER
+            setPadding(0, 0, 0, 48)
+        }
+
+        toggleButton = Button(this).apply {
+            text = "Start Recording"
+            textSize = 16f
+            setPadding(64, 32, 64, 32)
+            setOnClickListener {
+                if (isRecording) {
+                    stopRecordingService()
+                    isRecording = false
+                    updateUI()
+                } else {
+                    checkPermissionsAndStart()
+                }
+            }
+        }
+
+        layout.addView(statusText)
+        layout.addView(toggleButton)
+        setContentView(layout)
+
+        mediaProjectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+    }
+
+    private fun updateUI() {
+        if (isRecording) {
+            statusText.text = "Recording in progress...\nSaved to Movies/ScreenRecordings"
+            toggleButton.text = "Stop Recording"
+        } else {
+            statusText.text = "Recording Saved!\nReady to Record Again"
+            toggleButton.text = "Start Recording"
+        }
+    }
+
+    private fun checkPermissionsAndStart() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            Toast.makeText(this, "Internal audio requires Android 10 (API 29) or higher.", Toast.LENGTH_LONG).show()
+            return
+        }
+
+        val permissionsNeeded = mutableListOf<String>()
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            permissionsNeeded.add(Manifest.permission.RECORD_AUDIO)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                permissionsNeeded.add(Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }
+
+        if (permissionsNeeded.isNotEmpty()) {
+            ActivityCompat.requestPermissions(this, permissionsNeeded.toTypedArray(), 101)
+        } else {
+            screenCaptureLauncher.launch(mediaProjectionManager.createScreenCaptureIntent())
+        }
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 101 && grantResults.all { it == PackageManager.PERMISSION_GRANTED }) {
+            screenCaptureLauncher.launch(mediaProjectionManager.createScreenCaptureIntent())
+        } else {
+            Toast.makeText(this, "Audio permission is required for internal audio capture.", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun startRecordingService(resultCode: Int, data: Intent) {
+        val serviceIntent = Intent(this, ScreenRecordService::class.java).apply {
+            action = ScreenRecordService.ACTION_START
+            putExtra(ScreenRecordService.EXTRA_RESULT_CODE, resultCode)
+            putExtra(ScreenRecordService.EXTRA_DATA, data)
+        }
+        ContextCompat.startForegroundService(this, serviceIntent)
+    }
+
+    private fun stopRecordingService() {
+        val serviceIntent = Intent(this, ScreenRecordService::class.java).apply {
+            action = ScreenRecordService.ACTION_STOP
+        }
+        startService(serviceIntent)
+    }
+}
+
+/**
+ * Foreground Service that captures the screen via MediaProjection + MediaCodec
+ * and captures internal system audio via AudioPlaybackCaptureConfiguration.
+ */
+@RequiresApi(Build.VERSION_CODES.Q)
+class ScreenRecordService : Service() {
+
+    companion object {
+        const val ACTION_START = "ACTION_START"
+        const val ACTION_STOP = "ACTION_STOP"
+        const val EXTRA_RESULT_CODE = "EXTRA_RESULT_CODE"
+        const val EXTRA_DATA = "EXTRA_DATA"
+        const val CHANNEL_ID = "ScreenRecordChannel"
+        const val NOTIFICATION_ID = 1001
+    }
+
+    private var mediaProjection: MediaProjection? = null
+    private var virtualDisplay: VirtualDisplay? = null
+    private var videoEncoder: MediaCodec? = null
+    private var audioEncoder: MediaCodec? = null
+    private var audioRecord: AudioRecord? = null
+    private var mediaMuxer: MediaMuxer? = null
+
+    private var videoTrackIndex = -1
+    private var audioTrackIndex = -1
+    private var isMuxerStarted = false
+
+    @Volatile
+    private var isRecording = false
+    private lateinit var tempOutputFile: File
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        when (intent?.action) {
+            ACTION_START -> {
+                startForegroundNotification()
+                val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED)
+                val data: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    intent.getParcelableExtra(EXTRA_DATA, Intent::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableExtra(EXTRA_DATA)
+                }
+                if (data != null) {
+                    startRecording(resultCode, data)
+                }
+            }
+            ACTION_STOP -> {
+                stopRecording()
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+            }
+        }
+        return START_NOT_STICKY
+    }
+
+    private fun startForegroundNotification() {
+        val manager = getSystemService(NotificationManager::class.java)
+        val channel = NotificationChannel(
+            CHANNEL_ID,
+            "Screen Recording Service",
+            NotificationManager.IMPORTANCE_LOW
+        )
+        manager.createNotificationChannel(channel)
+
+        val notification: Notification = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("Screen Recorder Active")
+            .setContentText("Recording screen and internal audio...")
+            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+            .build()
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
+    }
+
+    private fun startRecording(resultCode: Int, data: Intent) {
+        val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        mediaProjection = projectionManager.getMediaProjection(resultCode, data)
+
+        val metrics: DisplayMetrics = resources.displayMetrics
+        // Ensure dimensions are even numbers for H.264 compatibility
+        val width = (metrics.widthPixels / 2) * 2
+        val height = (metrics.heightPixels / 2) * 2
+        val density = metrics.densityDpi
+
+        val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        tempOutputFile = File(cacheDir, "ScreenRec_$timestamp.mp4")
+
+        mediaMuxer = MediaMuxer(tempOutputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+
+        setupVideoEncoder(width, height)
+        setupInternalAudioCapture()
+
+        val inputSurface = videoEncoder!!.createInputSurface()
+        videoEncoder!!.start()
+        audioEncoder!!.start()
+        audioRecord!!.startRecording()
+
+        virtualDisplay = mediaProjection?.createVirtualDisplay(
+            "ScreenCapture",
+            width, height, density,
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+            inputSurface, null, null
+        )
+
+        isRecording = true
+
+        // Start Video Encoding Loop
+        thread(name = "VideoEncoderThread") { drainVideoEncoder() }
+
+        // Start Internal Audio Capture & Encoding Loop
+        thread(name = "AudioCaptureThread") { captureAndEncodeAudio() }
+    }
+
+    private fun setupVideoEncoder(width: Int, height: Int) {
+        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
+            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+            setInteger(MediaFormat.KEY_BIT_RATE, 6_000_000) // 6 Mbps
+            setInteger(MediaFormat.KEY_FRAME_RATE, 30)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+        }
+        videoEncoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).apply {
+            configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+        }
+    }
+
+    private fun setupInternalAudioCapture() {
+        val sampleRate = 44100
+        val channelConfig = AudioFormat.CHANNEL_IN_STEREO
+        val audioFormat = AudioFormat.ENCODING_PCM_16BIT
+
+        // Configure Internal Audio Playback Capture
+        val playbackConfig = AudioPlaybackCaptureConfiguration.Builder(mediaProjection!!)
+            .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+            .addMatchingUsage(AudioAttributes.USAGE_GAME)
+            .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+            .build()
+
+        val format = AudioFormat.Builder()
+            .setEncoding(audioFormat)
+            .setSampleRate(sampleRate)
+            .setChannelMask(channelConfig)
+            .build()
+
+        val minBufferSize = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat)
+
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+            audioRecord = AudioRecord.Builder()
+                .setAudioFormat(format)
+                .setBufferSizeInBytes(minBufferSize * 2)
+                .setAudioPlaybackCaptureConfig(playbackConfig)
+                .build()
+        }
+
+        // Configure AAC Audio Encoder
+        val encodeFormat = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, sampleRate, 2).apply {
+            setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
+            setInteger(MediaFormat.KEY_BIT_RATE, 128_000) // 128 kbps
+            setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, minBufferSize * 2)
+        }
+
+        audioEncoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC).apply {
+            configure(encodeFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+        }
+    }
+
+    private fun drainVideoEncoder() {
+        val bufferInfo = MediaCodec.BufferInfo()
+        while (isRecording) {
+            val encoderStatus = videoEncoder?.dequeueOutputBuffer(bufferInfo, 10_000) ?: break
+            if (encoderStatus == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                synchronized(this) {
+                    if (!isMuxerStarted) {
+                        videoTrackIndex = mediaMuxer!!.addTrack(videoEncoder!!.outputFormat)
+                        checkAndStartMuxer()
+                    }
+                }
+            } else if (encoderStatus >= 0) {
+                val encodedData = videoEncoder!!.getOutputBuffer(encoderStatus)
+                if (encodedData != null && bufferInfo.size > 0 && isMuxerStarted) {
+                    encodedData.position(bufferInfo.offset)
+                    encodedData.limit(bufferInfo.offset + bufferInfo.size)
+                    mediaMuxer!!.writeSampleData(videoTrackIndex, encodedData, bufferInfo)
+                }
+                videoEncoder!!.releaseOutputBuffer(encoderStatus, false)
+            }
+        }
+    }
+
+    private fun captureAndEncodeAudio() {
+        val bufferInfo = MediaCodec.BufferInfo()
+        val readBuffer = ByteArray(2048)
+
+        while (isRecording) {
+            val bytesRead = audioRecord?.read(readBuffer, 0, readBuffer.size) ?: 0
+            if (bytesRead > 0) {
+                val inputIndex = audioEncoder?.dequeueInputBuffer(10_000) ?: -1
+                if (inputIndex >= 0) {
+                    val inputBuffer: ByteBuffer? = audioEncoder?.getInputBuffer(inputIndex)
+                    inputBuffer?.clear()
+                    inputBuffer?.put(readBuffer, 0, bytesRead)
+                    val presentationTimeUs = System.nanoTime() / 1000L
+                    audioEncoder?.queueInputBuffer(inputIndex, 0, bytesRead, presentationTimeUs, 0)
+                }
+            }
+
+            var outputIndex = audioEncoder?.dequeueOutputBuffer(bufferInfo, 0) ?: -1
+            while (outputIndex >= 0 || outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                if (outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                    synchronized(this) {
+                        if (!isMuxerStarted) {
+                            audioTrackIndex = mediaMuxer!!.addTrack(audioEncoder!!.outputFormat)
+                            checkAndStartMuxer()
+                        }
+                    }
+                } else if (outputIndex >= 0) {
+                    val encodedData = audioEncoder!!.getOutputBuffer(outputIndex)
+                    if (encodedData != null && bufferInfo.size > 0 && isMuxerStarted) {
+                        encodedData.position(bufferInfo.offset)
+                        encodedData.limit(bufferInfo.offset + bufferInfo.size)
+                        mediaMuxer!!.writeSampleData(audioTrackIndex, encodedData, bufferInfo)
+                    }
+                    audioEncoder!!.releaseOutputBuffer(outputIndex, false)
+                }
+                outputIndex = audioEncoder?.dequeueOutputBuffer(bufferInfo, 0) ?: -1
+            }
+        }
+    }
+
+    private fun checkAndStartMuxer() {
+        if (videoTrackIndex != -1 && audioTrackIndex != -1 && !isMuxerStarted) {
+            mediaMuxer?.start()
+            isMuxerStarted = true
+        }
+    }
+
+    private fun stopRecording() {
+        isRecording = false
+        try {
+            Thread.sleep(200) // Allow threads to finish current frame
+            virtualDisplay?.release()
+            mediaProjection?.stop()
+
+            audioRecord?.stop()
+            audioRecord?.release()
+
+            videoEncoder?.stop()
+            videoEncoder?.release()
+
+            audioEncoder?.stop()
+            audioEncoder?.release()
+
+            if (isMuxerStarted) {
+                mediaMuxer?.stop()
+            }
+            mediaMuxer?.release()
+            isMuxerStarted = false
+
+            exportVideoToPublicStorage(tempOutputFile)
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    /**
+     * Exports the recorded MP4 from app cache directly into public phone storage
+     * (/Movies/ScreenRecordings/) via MediaStore.
+     */
+    private fun exportVideoToPublicStorage(sourceFile: File) {
+        if (!sourceFile.exists()) return
+
+        val values = ContentValues().apply {
+            put(MediaStore.Video.Media.DISPLAY_NAME, sourceFile.name)
+            put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+            put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/ScreenRecordings")
+            put(MediaStore.Video.Media.IS_PENDING, 1)
+        }
+
+        val resolver = contentResolver
+        val uri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
+
+        uri?.let {
+            resolver.openOutputStream(it)?.use { outputStream ->
+                FileInputStream(sourceFile).use { inputStream ->
+                    inputStream.copyTo(outputStream)
+                }
+            }
+            values.clear()
+            values.put(MediaStore.Video.Media.IS_PENDING, 0)
+            resolver.update(it, values, null, null)
+            sourceFile.delete()
+        }
+    }
+}
